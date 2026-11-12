@@ -18,6 +18,15 @@ def initialize_database():
             upload_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS users(
+                user_id TEXT PRIMARY KEY,
+                username TEXT NOT NULL UNIQUE,
+                password_hash BLOB NOT NULL,
+                salt BLOB NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+        """)
         connection.commit()
 
 def save_file_record(file_id, original_name, stored_name, category, file_size, owner_id):
@@ -55,6 +64,27 @@ def get_file_record(file_id):
             return None
 
         return dict(record)
+
+def list_files(owner_id):
+    with sqlite3.connect(DATABASE) as connection:
+        connection.row_factory = sqlite3.Row
+        #retrieves metadata for files belonging to one user, sorted by upload time, newest first
+        cursor = connection.execute("""
+            SELECT   
+                file_id,
+                original_name,
+                category,
+                file_size,
+                upload_time
+            FROM files
+            WHERE owner_id = ?
+            ORDER BY upload_time DESC
+        """, (owner_id,))
+
+        records = cursor.fetchall() #use fetchall because possibly retrieving multiple files
+
+        return [dict(record) for record in records] #converts the SQL lite records into a list of python dictionaries
+
 if __name__ == "__main__":
     initialize_database()
     print("File metadata database initialized successfully")
