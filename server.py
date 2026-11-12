@@ -6,7 +6,8 @@ from protocol import send_message, receive_message
 from file_manager import (
     initialize_database,
     save_file_record,
-    get_file_record
+    get_file_record,
+    list_files
 )
 
 
@@ -18,23 +19,22 @@ def process_request(request):
     action = request.get("action")
 
     if action == "LIST":
+        files = list_files("test_user")
+
         return {
             "status": "success",
-            "message": "File listing not implemented yet"
+            "files": files
         }
-
     elif action == "UPLOAD":
         return {
-            "status": "success",
-            "message": "Upload request received"
+            "status": "error",
+            "message": "Upload must use the file transfer handler"
         }
-
     elif action == "DOWNLOAD":
         return {
             "status": "error",
-            "message": "Download not implemented yet"
+            "message": "Download must use the file transfer handler"
         }
-
     else:
         return {
             "status": "error",
