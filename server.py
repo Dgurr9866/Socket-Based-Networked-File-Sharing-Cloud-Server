@@ -9,17 +9,17 @@ from file_manager import (
     get_file_record,
     list_files
 )
-
+from authentication import authenticate_user
 
 HOST = "0.0.0.0"
 PORT = 5050
 
 
-def process_request(request):
+def process_request(request, user_id):
     action = request.get("action")
 
     if action == "LIST":
-        files = list_files("test_user")
+        files = list_files(user_id)
 
         return {
             "status": "success",
@@ -67,7 +67,7 @@ def get_file_category(filename):
 
 
 
-def handle_upload(conn, request):
+def handle_upload(conn, request, user_id):
     filename = request.get("filename")
     filesize = request.get("filesize")
 
@@ -116,7 +116,7 @@ def handle_upload(conn, request):
             stored_name=stored_name,
             category=category,
             file_size=filesize,
-            owner_id="test_user"
+            owner_id=user_id
         )
     except Exception:
         destination.unlink(missing_ok=True)
@@ -128,7 +128,7 @@ def handle_upload(conn, request):
         "file_id": file_id
     }
 
-def handle_download(conn, request):
+def handle_download(conn, request, user_id):
     file_id = request.get("file_id")
 
     if not isinstance(file_id, str):
@@ -145,7 +145,7 @@ def handle_download(conn, request):
         }
     #temporary ownership check until authentication exists
 
-    if record["owner_id"] != "test_user":
+    if record["owner_id"] != user_id:
         return {
             "status": "error",
             "message": "Access denied"
@@ -186,6 +186,9 @@ def handle_download(conn, request):
 def handle_client(conn, addr):
     print(f"Client connected: {addr}")
 
+    #each client connection has its own authenticate state
+    user_id = None
+
     try:
         with conn:
             while True:
@@ -195,23 +198,68 @@ def handle_client(conn, addr):
                 except ConnectionError:
                     break
 
-                if request.get("action") == "UPLOAD":
-                   response = handle_upload(conn, request)
+                if not isinstance(request, dict):
+                    send_message(conn, {
+                        "status": "error",
+                        "message": "Invalid request"
+                    })
+                    continue
+                action = request.get("action")
 
-                elif request.get("action") == "DOWNLOAD":
-                   response = handle_download(conn, request)
+                if action == "LOGIN":
+                    username = request.get("username")
+                    password = request.get("password")
+
+                    authenticated_id = authenticate_user(
+                        username, password
+                    )
+
+                    if authenticated_id is not None:
+                        user_id = authenticated_id
+
+                        response = {
+                            "status": "success",
+                            "message": "Login successful"
+                        }
+
+                    else:
+                        user_id = None
+
+                        response = {
+                            "status": "error",
+                            "message": "Invalid credentials"
+                        }
+
+                elif user_id is None:
+                    response = {
+                        "status": "error",
+                        "message": "Authentication required"
+                    }
+                elif action == "UPLOAD":
+                    response = handle_upload(conn, request, user_id)
+
+                elif action == "DOWNLOAD":
+                    response = handle_download(conn, request, user_id)
+
+                elif action == "LIST":
+                    response = process_request(request, user_id)
 
                 else:
-                   response = process_request(request)
+                    response = {
+                        "status": "error",
+                        "message": "Unknown action"
+                    }
 
                 if response is not None:
                     send_message(conn, response)
-
     except (OSError, ValueError) as error:
         print(f"Client error {addr}: {error}")
 
     finally:
         print(f"Client disconnected: {addr}")
+
+
+
 
 initialize_database()
 
