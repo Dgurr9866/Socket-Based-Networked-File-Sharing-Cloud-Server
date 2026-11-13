@@ -2,50 +2,58 @@ import socket
 import threading
 from pathlib import Path
 import uuid
+import time
+
 from protocol import send_message, receive_message
 from file_manager import (
     initialize_database,
     save_file_record,
-    get_file_record,
-    list_files
+    get_file_record
 )
-from authentication import authenticate_user
+from analytics import NetworkAnalytics
+import protocol
+
 
 HOST = "0.0.0.0"
 PORT = 5050
 
+analytics = NetworkAnalytics(
+    log_file="cloud_server_metrics.csv"
+)
 
-def process_request(request, user_id):
+def process_request(request):
     action = request.get("action")
 
     if action == "LIST":
-        files = list_files(user_id)
-
         return {
             "status": "success",
-            "files": files
+            "message": "File listing not implemented yet"
         }
+
     elif action == "UPLOAD":
         return {
-            "status": "error",
-            "message": "Upload must use the file transfer handler"
+            "status": "success",
+            "message": "Upload request received"
         }
+
     elif action == "DOWNLOAD":
         return {
             "status": "error",
-            "message": "Download must use the file transfer handler"
+            "message": "Download not implemented yet"
         }
+
     else:
         return {
             "status": "error",
             "message": "Unknown action"
         }
 
+
 STORAGE_DIR = Path(__file__).resolve().parent / "storage"
 STORAGE_DIR.mkdir(exist_ok=True)
 
 CHUNK_SIZE = 64 * 1024
-MAX_FILE_SIZE = 100 * 1024 * 1024 # 100MB
+MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
 
 FILE_TYPES = {
     ".txt": ("text", "txt"),
@@ -58,16 +66,14 @@ FILE_TYPES = {
     ".jpg": ("image", "img"),
     ".jpeg": ("image", "img"),
     ".png": ("image", "img"),
-
 }
+
 
 def get_file_category(filename):
     extension = Path(filename).suffix.lower()
     return FILE_TYPES.get(extension, ("other", "oth"))
 
-
-
-def handle_upload(conn, request, user_id):
+def handle_upload(conn, request):
     filename = request.get("filename")
     filesize = request.get("filesize")
 
@@ -75,9 +81,12 @@ def handle_upload(conn, request, user_id):
         return {"status": "error", "message": "Invalid filename"}
 
     if type(filesize) is not int or not 0 <= filesize <= MAX_FILE_SIZE:
-        return{"status": "error", "message": "Invalid file size"}
+        return {
+            "status": "error",
+            "message": "Invalid file size"
+        }
 
-    #use only the extension; never trust a client-supplied path
+    # use only the extension; never trust a client-supplied path
     extension = Path(filename).suffix.lower()
 
     category, prefix = get_file_category(filename)
@@ -89,10 +98,11 @@ def handle_upload(conn, request, user_id):
     stored_name = f"{prefix}_{file_id}{extension}"
     destination = category_dir / stored_name
 
-    #tell the client that the server is ready for file bytes
+    # tell the client that the server is ready for file bytes
     send_message(conn, {"status": "ready"})
 
     remaining = filesize
+    transfer_start = time.perf_counter()
 
     try:
         with open(destination, "wb") as file:
@@ -109,6 +119,8 @@ def handle_upload(conn, request, user_id):
         destination.unlink(missing_ok=True)
         raise
 
+    transfer_time = time.perf_counter() - transfer_start
+
     try:
         save_file_record(
             file_id=file_id,
@@ -116,11 +128,22 @@ def handle_upload(conn, request, user_id):
             stored_name=stored_name,
             category=category,
             file_size=filesize,
-            owner_id=user_id
+            owner_id="test_user"
         )
+
     except Exception:
         destination.unlink(missing_ok=True)
         raise
+
+    analytics.log_metric(
+        source="SERVER",
+        client_id=addr if "addr" in locals() else threading.current_thread().name,
+        operation="UPLOAD",
+        file_name=filename,
+        file_size_bytes=filesize,
+        transfer_time_sec=transfer_time,
+        status="SUCCESS"
+    )
 
     return {
         "status": "success",
@@ -128,50 +151,52 @@ def handle_upload(conn, request, user_id):
         "file_id": file_id
     }
 
-def handle_download(conn, request, user_id):
+def handle_download(conn, request):
+    start_time = time.perf_counter()
+
     file_id = request.get("file_id")
 
     if not isinstance(file_id, str):
-        return {
-            "stats": "error",
-            "message": "Invalid file ID"
-        }
+        return {"stats": "error", "message": "Invalid file ID"}
+
     record = get_file_record(file_id)
 
     if record is None:
-        return {
-            "status": "error",
-            "message": "File not found"
-        }
-    #temporary ownership check until authentication exists
+        return {"status": "error", "message": "File not found"}
 
-    if record["owner_id"] != user_id:
-        return {
-            "status": "error",
-            "message": "Access denied"
-        }
+    # temporary ownership check until authentication exists
+    if record["owner_id"] != "test_user":
+        return {"status": "error", "message": "Access denied"}
+
     category = record["category"]
     stored_name = record["stored_name"]
 
-    #build the path from trusted storage metadata
+    # build the path from trusted storage metadata
     filepath = STORAGE_DIR / category / stored_name
 
     if not filepath.is_file():
         return {
             "status": "error",
             "message": "File missing from storage"
-
         }
+
     filesize = filepath.stat().st_size
 
-    #send the file information before the binary data
-    send_message(conn, {
-        "status": "ready",
-        "filename": record["original_name"],
-        "filesize": filesize
-    })
+    response_time = time.perf_counter() - start_time
 
-    #stream the file in chunks
+    # send the file information before the binary data
+    send_message(
+        conn,
+        {
+            "status": "ready",
+            "filename": record["original_name"],
+            "filesize": filesize
+        }
+    )
+
+    # stream the file in chunks
+    transfer_start = time.perf_counter()
+
     with open(filepath, "rb") as file:
         while True:
             chunk = file.read(CHUNK_SIZE)
@@ -180,14 +205,24 @@ def handle_download(conn, request, user_id):
                 break
 
             conn.sendall(chunk)
-    return None
 
+    transfer_time = time.perf_counter() - transfer_start
+
+    analytics.log_metric(
+        source="SERVER",
+        client_id=threading.current_thread().name,
+        operation="DOWNLOAD",
+        file_name=record["original_name"],
+        file_size_bytes=filesize,
+        transfer_time_sec=transfer_time,
+        response_time_sec=response_time,
+        status="SUCCESS"
+    )
+
+    return None
 
 def handle_client(conn, addr):
     print(f"Client connected: {addr}")
-
-    #each client connection has its own authenticate state
-    user_id = None
 
     try:
         with conn:
@@ -198,84 +233,80 @@ def handle_client(conn, addr):
                 except ConnectionError:
                     break
 
-                if not isinstance(request, dict):
-                    send_message(conn, {
-                        "status": "error",
-                        "message": "Invalid request"
-                    })
-                    continue
-                action = request.get("action")
+                start_time = time.perf_counter()
 
-                if action == "LOGIN":
-                    username = request.get("username")
-                    password = request.get("password")
+                if request.get("action") == "UPLOAD":
+                    response = handle_upload(conn, request)
 
-                    authenticated_id = authenticate_user(
-                        username, password
+                elif request.get("action") == "DOWNLOAD":
+                    response = handle_download(conn, request)
+
+                elif request.get("action") == "METRICS":
+                    # Receive JSON list of client metrics
+                    # and store in server DataFrame
+                    client_metrics = request.get("metrics", [])
+
+                    analytics.ingest_client_report(
+                        addr,
+                        client_metrics
                     )
 
-                    if authenticated_id is not None:
-                        user_id = authenticated_id
-
-                        response = {
-                            "status": "success",
-                            "message": "Login successful"
-                        }
-
-                    else:
-                        user_id = None
-
-                        response = {
-                            "status": "error",
-                            "message": "Invalid credentials"
-                        }
-
-                elif user_id is None:
                     response = {
-                        "status": "error",
-                        "message": "Authentication required"
+                        "status": "success",
+                        "message": "Metrics logged"
                     }
-                elif action == "UPLOAD":
-                    response = handle_upload(conn, request, user_id)
 
-                elif action == "DOWNLOAD":
-                    response = handle_download(conn, request, user_id)
+                elif request.get("action") == "LIST":
+                    response = process_request(request)
 
-                elif action == "LIST":
-                    response = process_request(request, user_id)
+                    response_time = (
+                        time.perf_counter() - start_time
+                    )
+
+                    analytics.log_metric(
+                        source="SERVER",
+                        client_id=addr,
+                        operation="DIR",
+                        response_time_sec=response_time,
+                        status="SUCCESS"
+                    )
 
                 else:
-                    response = {
-                        "status": "error",
-                        "message": "Unknown action"
-                    }
+                    response = process_request(request)
 
                 if response is not None:
                     send_message(conn, response)
+
     except (OSError, ValueError) as error:
         print(f"Client error {addr}: {error}")
 
     finally:
         print(f"Client disconnected: {addr}")
 
-
-
-
 initialize_database()
 
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind((HOST, PORT))
-    server.listen()
+try:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((HOST, PORT))
+        server.listen()
 
-    print(f"Server listening on port {PORT}")
+        print(f"Server listening on port {PORT}")
 
-    while True:
-        conn, addr = server.accept()
+        while True:
+            conn, addr = server.accept()
 
-        client_thread = threading.Thread(
-            target=handle_client,
-            args=(conn, addr),
-            daemon=True
-        )
-        client_thread.start()
+            client_thread = threading.Thread(
+                target=handle_client,
+                args=(conn, addr),
+                daemon=True
+            )
+            client_thread.start()
+
+except KeyboardInterrupt:
+    print("Server shutdown requested.")
+finally:
+    analytics.generate_report_summary()
+    analytics.save_to_csv()
+
+    print("Analytics report saved.")

@@ -5,11 +5,23 @@ import queue
 import socket
 import threading
 import tkinter as tk
+
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+from tkinter import simpledialog
+
+from protocol import send_message, receive_message
+
+CMD_METRICS = "METRICS"
 
 CHUNK = 64 * 1024
 MAX_HEADER = 64 * 1024
+
+HOST = "127.0.0.1"
+PORT = 5050
+
+DOWNLOAD_DIR = Path("downloads")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 
 def send_json(sock, obj):
@@ -43,11 +55,7 @@ class FileShareClient(tk.Tk):
     """Tkinter interface for browsing and transferring server files."""
 
     def __init__(self):
-        """Create the window, connection settings, file list, and action controls.
-
-        Network work is tracked through an event queue; polling that queue from
-        Tk's main loop keeps UI updates on the thread that owns the widgets.
-        """
+        """Create the window, connection settings, file list, and action controls."""
         super().__init__()
         self.title("File Sharing Client")
         self.geometry("850x560")
@@ -132,13 +140,7 @@ class FileShareClient(tk.Tk):
         return socket.create_connection((host, port), timeout=10)
 
     def request(self, req, payload=None, destination=None):
-        """Run one server request and optionally stream an upload or download.
-
-        Upload bytes are sent in fixed-size chunks. For downloads, the response
-        supplies the byte count; data is written to a temporary file and only
-        renamed to the destination after all bytes arrive. Progress is posted
-        to the UI event queue instead of updating Tk widgets from this method.
-        """
+        """Run one server request and optionally stream an upload or download."""
         with self.connection() as sock:
             sock.settimeout(30)
             send_json(sock, req)
@@ -158,7 +160,6 @@ class FileShareClient(tk.Tk):
                 if not isinstance(length, int) or length < 0:
                     raise ValueError("Server returned an invalid file size")
                 remaining = length
-                # Use an incomplete temporary file so failed downloads don't look finished.
                 tmp = Path(str(destination) + ".part")
                 try:
                     with open(tmp, "wb") as stream:
@@ -176,16 +177,13 @@ class FileShareClient(tk.Tk):
             return response
 
     def run_job(self, label, operation, on_success=None):
-        """Run a network operation on a worker thread and report its result.
-
-        Only one operation may run at a time. The worker places completion or
-        failure events on the queue for poll_events to handle in the UI thread.
-        """
+        """Run a network operation on a worker thread and report its result."""
         if self.busy:
             return
         self.busy = True
         self.progress["value"] = 0
         self.status.set(label)
+
         def worker():
             """Execute the job off the UI thread and enqueue its outcome."""
             try:
@@ -193,6 +191,7 @@ class FileShareClient(tk.Tk):
                 self.events.put(("done", label, result, on_success))
             except Exception as exc:
                 self.events.put(("error", str(exc)))
+
         threading.Thread(target=worker, daemon=True).start()
 
     def poll_events(self):
@@ -300,10 +299,7 @@ class FileShareClient(tk.Tk):
                      lambda _resp: self.refresh())
 
     def delete(self):
-        """Confirm and delete the selected server item, then refresh the view.
-
-        The server requires folders to be empty before they can be deleted.
-        """
+        """Confirm and delete the selected server item, then refresh the view."""
         try:
             item = self.selected()
             remote = self.remote_path(item["name"])
@@ -315,6 +311,49 @@ class FileShareClient(tk.Tk):
         self.run_job("Deleting " + item["name"], lambda: self.request({"cmd": "DELETE", "path": remote}),
                      lambda _resp: self.refresh())
 
-
 if __name__ == "__main__":
+
     FileShareClient().mainloop()
+
+    file_id = input("Enter the file ID to download: ").strip()
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client:
+        client.connect((HOST, PORT))
+
+        request = {
+            "action": "DOWNLOAD",
+            "file_id": file_id
+        }
+
+        send_message(client, request)
+
+        response = receive_message(client)
+        print("Server response: ", response)
+
+        if response.get("status") == "ready":
+            filename = Path(response["filename"]).name
+            filesize = response["filesize"]
+
+            if (not filename or filename in (".", "..")
+                    or type(filesize) is not int or filesize < 0):
+                raise ValueError("Invalid download metadata")
+
+            destination = DOWNLOAD_DIR / filename
+            remaining = filesize
+
+            try:
+                with open(destination, "wb") as file:
+                    while remaining > 0:
+                        chunk = client.recv(min(65536, remaining))
+
+                        if not chunk:
+                            raise ConnectionError("Download interrupted")
+
+                        file.write(chunk)
+                        remaining -= len(chunk)
+
+            except (OSError, ConnectionError):
+                destination.unlink(missing_ok=True)
+                raise
+
+            print(f"Download complete: {destination}")

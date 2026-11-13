@@ -2,6 +2,10 @@ import json
 import struct
 
 MAX_MESSAGE_SIZE = 1024 * 1024 #1 MB
+CMD_METRICS = "METRICS"
+CMD_UPLOAD = "UPLOAD"
+CMD_DOWNLOAD = "DOWNLOAD"
+CMD_LIST = "LIST"
 
 def receive_exact(sock, size):
     data = bytearray()
