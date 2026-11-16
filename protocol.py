@@ -1,45 +1,54 @@
+"""TCP messages are newline-delimited JSON followed by any declared file bytes."""
+
 import json
-import struct
 
-MAX_MESSAGE_SIZE = 1024 * 1024 #1 MB
-CMD_METRICS = "METRICS"
-CMD_UPLOAD = "UPLOAD"
-CMD_DOWNLOAD = "DOWNLOAD"
-CMD_LIST = "LIST"
+CHUNK_SIZE = 1024 * 1024
+MAX_HEADER = 64 * 1024
 
-def receive_exact(sock, size):
-    data = bytearray()
 
-    while len(data) < size:
-        chunk = sock.recv(size - len(data))
+class ProtocolError(Exception):
+    """The TCP stream cannot be used for another request."""
 
+
+def send_message(connection, **fields):
+    connection.sendall(json.dumps(fields).encode("utf-8") + b"\n")
+
+
+def read_message(reader):
+    line = reader.readline(MAX_HEADER + 1)
+    if not line:
+        raise EOFError("Peer closed the connection.")
+    if len(line) > MAX_HEADER or not line.endswith(b"\n"):
+        raise ProtocolError("Invalid message header length.")
+    try:
+        message = json.loads(line)
+    except (ValueError, UnicodeError) as error:
+        raise ProtocolError("Invalid JSON header.") from error
+    if not isinstance(message, dict):
+        raise ProtocolError("Expected a JSON object.")
+    return message
+
+
+def file_size(message):
+    size = message.get("size")
+    if type(size) is not int or size < 0:
+        raise ProtocolError("Invalid file size.")
+    return size
+
+
+def send_file(connection, source, remaining):
+    while remaining:
+        chunk = source.read(min(CHUNK_SIZE, remaining))
         if not chunk:
-            raise ConnectionError("Connection closed unexpectedly")
-
-        data.extend(chunk)
-
-    return bytes(data)
-
-def send_message(sock, message):
-    data = json.dumps(message).encode("utf-8")
-
-    if len(data) > MAX_MESSAGE_SIZE:
-        raise ValueError("Message is too large")
-
-    header = struct.pack("!I", len(data))
-
-    sock.sendall(header + data)
+            raise ProtocolError("The source file became shorter during transfer.")
+        connection.sendall(chunk)
+        remaining -= len(chunk)
 
 
-def receive_message(sock):
-    header = receive_exact(sock, 4)
-
-    message_length = struct.unpack("!I", header)[0]
-
-    if message_length > MAX_MESSAGE_SIZE:
-        raise ValueError("Message is too large")
-
-    data = receive_exact(sock, message_length)
-
-    return json.loads(data.decode("utf-8"))
-
+def receive_file(reader, destination, remaining):
+    while remaining:
+        chunk = reader.read(min(CHUNK_SIZE, remaining))
+        if not chunk:
+            raise EOFError("Connection closed during file transfer.")
+        destination.write(chunk)
+        remaining -= len(chunk)

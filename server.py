@@ -1,312 +1,244 @@
+"""Run the multithreaded TCP file server."""
+
+import argparse
+from contextlib import contextmanager
+import ipaddress
+from pathlib import Path, PureWindowsPath
 import socket
-import threading
-from pathlib import Path
-import uuid
-import time
+import socketserver
+from tempfile import NamedTemporaryFile
+from threading import Lock
+from time import perf_counter
 
-from protocol import send_message, receive_message
-from file_manager import (
-    initialize_database,
-    save_file_record,
-    get_file_record
-)
-from analytics import NetworkAnalytics
-import protocol
+from analytics import Metrics
+from protocol import (ProtocolError, file_size, read_message, receive_file,
+                      send_file, send_message)
+
+TEMP_PREFIX = ".transfer-"
 
 
-HOST = "0.0.0.0"
-PORT = 5050
-
-analytics = NetworkAnalytics(
-    log_file="cloud_server_metrics.csv"
-)
-
-def process_request(request):
-    action = request.get("action")
-
-    if action == "LIST":
-        return {
-            "status": "success",
-            "message": "File listing not implemented yet"
-        }
-
-    elif action == "UPLOAD":
-        return {
-            "status": "success",
-            "message": "Upload request received"
-        }
-
-    elif action == "DOWNLOAD":
-        return {
-            "status": "error",
-            "message": "Download not implemented yet"
-        }
-
-    else:
-        return {
-            "status": "error",
-            "message": "Unknown action"
-        }
+class RequestError(Exception):
+    """An operation failed and the connection can still accept commands."""
 
 
-STORAGE_DIR = Path(__file__).resolve().parent / "storage"
-STORAGE_DIR.mkdir(exist_ok=True)
-
-CHUNK_SIZE = 64 * 1024
-MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
-
-FILE_TYPES = {
-    ".txt": ("text", "txt"),
-    ".pdf": ("text", "txt"),
-    ".docx": ("text", "txt"),
-    ".mp3": ("audio", "aud"),
-    ".wav": ("audio", "aud"),
-    ".mp4": ("video", "vid"),
-    ".mov": ("video", "vid"),
-    ".jpg": ("image", "img"),
-    ".jpeg": ("image", "img"),
-    ".png": ("image", "img"),
-}
+def storage_path(root, name):
+    if not isinstance(name, str) or not name:
+        raise RequestError("Enter a path relative to the shared folder.")
+    parts = name.split("/")
+    if any(part in ("", ".", "..") or part.startswith(TEMP_PREFIX)
+           or PureWindowsPath(part).is_reserved()
+           or part.endswith((" ", "."))
+           or any(ord(char) < 32 or char in '\\:*?"<>|' for char in part)
+           for part in parts):
+        raise RequestError("Use a valid relative path, such as media/file.wav.")
+    path = root.joinpath(*parts)
+    resolved = path.resolve()
+    if resolved != path:
+        raise RequestError("Shared paths must refer to ordinary files or folders.")
+    return path
 
 
-def get_file_category(filename):
-    extension = Path(filename).suffix.lower()
-    return FILE_TYPES.get(extension, ("other", "oth"))
-
-def handle_upload(conn, request):
-    filename = request.get("filename")
-    filesize = request.get("filesize")
-
-    if not isinstance(filename, str) or not filename:
-        return {"status": "error", "message": "Invalid filename"}
-
-    if type(filesize) is not int or not 0 <= filesize <= MAX_FILE_SIZE:
-        return {
-            "status": "error",
-            "message": "Invalid file size"
-        }
-
-    # use only the extension; never trust a client-supplied path
-    extension = Path(filename).suffix.lower()
-
-    category, prefix = get_file_category(filename)
-
-    category_dir = STORAGE_DIR / category
-    category_dir.mkdir(parents=True, exist_ok=True)
-
-    file_id = uuid.uuid4().hex
-    stored_name = f"{prefix}_{file_id}{extension}"
-    destination = category_dir / stored_name
-
-    # tell the client that the server is ready for file bytes
-    send_message(conn, {"status": "ready"})
-
-    remaining = filesize
-    transfer_start = time.perf_counter()
-
-    try:
-        with open(destination, "wb") as file:
-            while remaining > 0:
-                chunk = conn.recv(min(CHUNK_SIZE, remaining))
-
-                if not chunk:
-                    raise ConnectionError("Upload interrupted")
-
-                file.write(chunk)
-                remaining -= len(chunk)
-
-    except (OSError, ConnectionError):
-        destination.unlink(missing_ok=True)
-        raise
-
-    transfer_time = time.perf_counter() - transfer_start
-
-    try:
-        save_file_record(
-            file_id=file_id,
-            original_name=filename,
-            stored_name=stored_name,
-            category=category,
-            file_size=filesize,
-            owner_id="test_user"
-        )
-
-    except Exception:
-        destination.unlink(missing_ok=True)
-        raise
-
-    analytics.log_metric(
-        source="SERVER",
-        client_id=addr if "addr" in locals() else threading.current_thread().name,
-        operation="UPLOAD",
-        file_name=filename,
-        file_size_bytes=filesize,
-        transfer_time_sec=transfer_time,
-        status="SUCCESS"
-    )
-
-    return {
-        "status": "success",
-        "message": "File uploaded successfully",
-        "file_id": file_id
-    }
-
-def handle_download(conn, request):
-    start_time = time.perf_counter()
-
-    file_id = request.get("file_id")
-
-    if not isinstance(file_id, str):
-        return {"stats": "error", "message": "Invalid file ID"}
-
-    record = get_file_record(file_id)
-
-    if record is None:
-        return {"status": "error", "message": "File not found"}
-
-    # temporary ownership check until authentication exists
-    if record["owner_id"] != "test_user":
-        return {"status": "error", "message": "Access denied"}
-
-    category = record["category"]
-    stored_name = record["stored_name"]
-
-    # build the path from trusted storage metadata
-    filepath = STORAGE_DIR / category / stored_name
-
-    if not filepath.is_file():
-        return {
-            "status": "error",
-            "message": "File missing from storage"
-        }
-
-    filesize = filepath.stat().st_size
-
-    response_time = time.perf_counter() - start_time
-
-    # send the file information before the binary data
-    send_message(
-        conn,
-        {
-            "status": "ready",
-            "filename": record["original_name"],
-            "filesize": filesize
-        }
-    )
-
-    # stream the file in chunks
-    transfer_start = time.perf_counter()
-
-    with open(filepath, "rb") as file:
+class FileHandler(socketserver.StreamRequestHandler):
+    def handle(self):
+        peer = f"{self.client_address[0]}:{self.client_address[1]}"
         while True:
-            chunk = file.read(CHUNK_SIZE)
+            try:
+                request = read_message(self.rfile)
+            except (EOFError, OSError, ProtocolError):
+                return
 
-            if not chunk:
-                break
-
-            conn.sendall(chunk)
-
-    transfer_time = time.perf_counter() - transfer_start
-
-    analytics.log_metric(
-        source="SERVER",
-        client_id=threading.current_thread().name,
-        operation="DOWNLOAD",
-        file_name=record["original_name"],
-        file_size_bytes=filesize,
-        transfer_time_sec=transfer_time,
-        response_time_sec=response_time,
-        status="SUCCESS"
-    )
-
-    return None
-
-def handle_client(conn, addr):
-    print(f"Client connected: {addr}")
-
-    try:
-        with conn:
-            while True:
-                try:
-                    request = receive_message(conn)
-
-                except ConnectionError:
-                    break
-
-                start_time = time.perf_counter()
-
-                if request.get("action") == "UPLOAD":
-                    response = handle_upload(conn, request)
-
-                elif request.get("action") == "DOWNLOAD":
-                    response = handle_download(conn, request)
-
-                elif request.get("action") == "METRICS":
-                    # Receive JSON list of client metrics
-                    # and store in server DataFrame
-                    client_metrics = request.get("metrics", [])
-
-                    analytics.ingest_client_report(
-                        addr,
-                        client_metrics
-                    )
-
-                    response = {
-                        "status": "success",
-                        "message": "Metrics logged"
-                    }
-
-                elif request.get("action") == "LIST":
-                    response = process_request(request)
-
-                    response_time = (
-                        time.perf_counter() - start_time
-                    )
-
-                    analytics.log_metric(
-                        source="SERVER",
-                        client_id=addr,
-                        operation="DIR",
-                        response_time_sec=response_time,
-                        status="SUCCESS"
-                    )
-
+            self.started = perf_counter()
+            self.response = self.transfer = self.size = None
+            command = request.get("command")
+            path = request.get("path", "")
+            outcome = "error"
+            close = False
+            try:
+                outcome = self.dispatch(command, path, request) or "ok"
+            except (RequestError, OSError, ValueError, RuntimeError) as error:
+                # Once a response begins, a stream error may leave file bytes pending.
+                if self.response is None:
+                    try:
+                        self.reply("error", message=str(error))
+                    except OSError:
+                        close = True
                 else:
-                    response = process_request(request)
+                    close = True
+            except (EOFError, ProtocolError):
+                close = True
+            finally:
+                self.server.metrics.record(
+                    peer, command, path, outcome=outcome,
+                    total=perf_counter() - self.started, response=self.response,
+                    size=self.size, transfer=self.transfer
+                )
+            if close or command == "quit":
+                return
 
-                if response is not None:
-                    send_message(conn, response)
+    def reply(self, status, **fields):
+        send_message(self.request, status=status, **fields)
+        if self.response is None:
+            self.response = perf_counter() - self.started
 
-    except (OSError, ValueError) as error:
-        print(f"Client error {addr}: {error}")
+    def dispatch(self, command, name, request):
+        root = self.server.root
+        if command in ("connect", "quit"):
+            self.reply("ok")
+            return
 
-    finally:
-        print(f"Client disconnected: {addr}")
+        if command == "dir":
+            folder = storage_path(root, name) if name else root
+            with self.server.storage_lock:
+                entries = [
+                    (entry.name, entry.is_dir())
+                    for entry in sorted(folder.iterdir())
+                    if not entry.name.startswith(TEMP_PREFIX) and not entry.is_symlink()
+                ]
+            self.reply("ok", count=len(entries))
+            for name, is_directory in entries:
+                send_message(self.request, name=name, directory=is_directory)
+            return
 
-initialize_database()
+        if command not in ("upload", "download", "delete", "mkdir", "rmdir"):
+            raise RequestError("Unknown command.")
 
-try:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind((HOST, PORT))
-        server.listen()
+        with self.server.storage_lock:
+            path = storage_path(root, name)
 
-        print(f"Server listening on port {PORT}")
+        if command in ("upload", "download"):
+            with self.reserve(path):
+                if command == "upload":
+                    completed = self.upload(path, file_size(request))
+                else:
+                    self.download(path)
+                    completed = True
+            self.reply("ok" if completed else "cancelled")
+            return "ok" if completed else "cancelled"
 
-        while True:
-            conn, addr = server.accept()
+        with self.server.storage_lock:
+            if path in self.server.active_paths:
+                raise RequestError("The file is currently being processed.")
+            if command == "delete":
+                if not path.is_file():
+                    raise RequestError("File does not exist.")
+                path.unlink()
+            elif command == "mkdir":
+                path.mkdir()
+            elif command == "rmdir":
+                if any(path in active.parents for active in self.server.active_paths):
+                    raise RequestError("A file in this folder is currently being processed.")
+                path.rmdir()
 
-            client_thread = threading.Thread(
-                target=handle_client,
-                args=(conn, addr),
-                daemon=True
-            )
-            client_thread.start()
+        self.reply("ok")
 
-except KeyboardInterrupt:
-    print("Server shutdown requested.")
-finally:
-    analytics.generate_report_summary()
-    analytics.save_to_csv()
+    @contextmanager
+    def reserve(self, path):
+        with self.server.storage_lock:
+            if path in self.server.active_paths:
+                raise RequestError("The file is currently being processed.")
+            self.server.active_paths.add(path)
+        try:
+            yield
+        finally:
+            with self.server.storage_lock:
+                self.server.active_paths.remove(path)
 
-    print("Analytics report saved.")
+    def upload(self, path, size):
+        if not path.parent.is_dir():
+            raise RequestError("Destination folder does not exist.")
+        if path.exists():
+            if not path.is_file():
+                raise RequestError("Destination is not a regular file.")
+            self.reply("overwrite")
+            answer = read_message(self.rfile).get("overwrite")
+            if answer is not True:
+                return False
+
+        temporary = None
+        try:
+            # A completed upload replaces the destination in one filesystem operation.
+            with NamedTemporaryFile(dir=path.parent, prefix=TEMP_PREFIX,
+                                    delete=False) as output:
+                temporary = Path(output.name)
+                self.reply("ready")
+                started = perf_counter()
+                receive_file(self.rfile, output, size)
+            temporary.replace(path)
+            self.transfer = perf_counter() - started
+            self.size = size
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return True
+
+    def download(self, path):
+        if not path.is_file():
+            raise RequestError("File does not exist.")
+        with path.open("rb") as source:
+            size = path.stat().st_size
+            self.reply("ok", size=size)
+            started = perf_counter()
+            send_file(self.request, source, size)
+            self.transfer = perf_counter() - started
+            self.size = size
+            if read_message(self.rfile).get("status") != "ok":
+                raise ProtocolError("Client did not confirm the download.")
+
+
+class FileServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+    def __init__(self, address, root, metrics):
+        self.root = root
+        self.metrics = metrics
+        self.storage_lock = Lock()
+        self.active_paths = set()
+        super().__init__(address, FileHandler)
+
+
+def local_addresses():
+    addresses = set()
+    for host in (socket.gethostname(), socket.getfqdn()):
+        try:
+            addresses.update(socket.gethostbyname_ex(host)[2])
+        except OSError:
+            pass
+    # A UDP connect asks the OS which local address it would use. It sends no packets.
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("192.0.2.1", 80))
+            addresses.add(probe.getsockname()[0])
+    except OSError:
+        pass
+    return sorted(address for address in addresses
+                  if not ipaddress.ip_address(address).is_loopback)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--host", default="0.0.0.0", help="IPv4 address to bind")
+    parser.add_argument("--port", type=int, default=5050)
+    parser.add_argument("--root", type=Path, default=Path("shared_files"))
+    parser.add_argument("--log", type=Path, default=Path("server_metrics.csv"))
+    args = parser.parse_args()
+    try:
+        root = args.root.resolve()
+        if args.log.resolve().is_relative_to(root):
+            parser.error("Choose a metrics log outside the shared folder.")
+        root.mkdir(parents=True, exist_ok=True)
+        with FileServer((args.host, args.port), root, Metrics(args.log, "server")) as server:
+            host, port = server.server_address
+            addresses = local_addresses() if host == "0.0.0.0" else [host]
+            print(f"Sharing {root} on {host}:{port}", flush=True)
+            for address in addresses or ["127.0.0.1"]:
+                print(f"Client command: connect {address} {port}", flush=True)
+            server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    except (OSError, OverflowError) as error:
+        parser.exit(1, f"Server error: {error}\n")
+
+
+if __name__ == "__main__":
+    main()
