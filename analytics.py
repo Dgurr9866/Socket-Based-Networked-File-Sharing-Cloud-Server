@@ -13,6 +13,7 @@ FIELDS = ("timestamp_utc", "side", "peer", "operation", "path", "bytes",
 
 class Metrics:
     def __init__(self, path, side):
+        """Create a CSV log for metrics recorded by the given endpoint side."""
         self.path = Path(path)
         self.side = side
         self.lock = Lock()
@@ -22,6 +23,7 @@ class Metrics:
 
     def record(self, peer, operation, path, *, outcome, total,
                response=None, size=None, transfer=None):
+        """Append timing, transfer, and outcome details for one operation."""
         rate = size / 1_000_000 / transfer if size is not None and transfer else None
         with self.lock, self.path.open("a", newline="", encoding="utf-8") as output:
             csv.writer(output).writerow((
@@ -35,6 +37,7 @@ class Metrics:
 
 
 def main():
+    """Print grouped outcome counts and average timings for CSV metric logs."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("logs", nargs="+", type=Path)
     args = parser.parse_args()
@@ -45,6 +48,7 @@ def main():
                 groups.setdefault((row["side"], row["operation"]), []).append(row)
 
     def average(rows, field):
+        """Format the average populated value for a metrics field."""
         values = [float(row[field]) for row in rows if row[field]]
         return f"{sum(values) / len(values):.3f}" if values else "-"
 
