@@ -42,7 +42,3 @@ Bring the three files specified in the handout. Verify their sizes before the te
    ```text
    python analytics.py server_metrics.csv client1_metrics.csv client2_metrics.csv
    ```
-
-The server starts its CSV logger on launch. Each client records its own commands in a separate log. Use `--log FILE` to choose a different filename. The logs include the operation, outcome, bytes transferred, time to first response, total operation time, transfer time, and decimal MB/s. Response time is the interval from the start of endpoint handling to the first reply sent or received. The client therefore includes network delay, while the server measures local handling up to the first reply. Transfer timings are endpoint-local and include file I/O. A client upload also includes waiting for the server's completion reply. Total time includes upload overwrite confirmation if prompted. Compare the same endpoint and operation across load conditions.
-
-For the report, graph client throughput and response time by file size and number of simultaneous clients. Use the logs and screenshots from your three-computer test. For the narrated video, show the threaded server, TCP framing, desktop client controls, CSV logging, and both clients completing operations on the private network.
