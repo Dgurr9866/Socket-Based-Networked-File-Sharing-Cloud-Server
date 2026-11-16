@@ -1,4 +1,3 @@
-"""Run the multithreaded TCP file server."""
 
 import argparse
 from contextlib import contextmanager
@@ -22,6 +21,7 @@ class RequestError(Exception):
 
 
 def storage_path(root, name):
+    """Validate a client path and return the matching path below the shared root."""
     if not isinstance(name, str) or not name:
         raise RequestError("Enter a path relative to the shared folder.")
     parts = name.split("/")
@@ -39,12 +39,16 @@ def storage_path(root, name):
 
 
 class FileHandler(socketserver.StreamRequestHandler):
+    """Handle a sequence of file-server commands on one client connection."""
+
     def handle(self):
+        """Read requests, dispatch commands, and record each request's metrics."""
         peer = f"{self.client_address[0]}:{self.client_address[1]}"
         while True:
             try:
                 request = read_message(self.rfile)
             except (EOFError, OSError, ProtocolError):
+                # A broken or closed stream cannot safely receive another reply.
                 return
 
             self.started = perf_counter()
@@ -72,15 +76,18 @@ class FileHandler(socketserver.StreamRequestHandler):
                     total=perf_counter() - self.started, response=self.response,
                     size=self.size, transfer=self.transfer
                 )
+            # Do not reuse a connection after a partial transfer or an explicit quit.
             if close or command == "quit":
                 return
 
     def reply(self, status, **fields):
+        """Send a response and record when the first response is sent."""
         send_message(self.request, status=status, **fields)
         if self.response is None:
             self.response = perf_counter() - self.started
 
     def dispatch(self, command, name, request):
+        """Run one client command and return its outcome for metrics logging."""
         root = self.server.root
         if command in ("connect", "quit"):
             self.reply("ok")
@@ -88,6 +95,7 @@ class FileHandler(socketserver.StreamRequestHandler):
 
         if command == "dir":
             folder = storage_path(root, name) if name else root
+            # Hold the lock while collecting entries so mutations cannot race the listing.
             with self.server.storage_lock:
                 entries = [
                     (entry.name, entry.is_dir())
@@ -106,6 +114,7 @@ class FileHandler(socketserver.StreamRequestHandler):
             path = storage_path(root, name)
 
         if command in ("upload", "download"):
+            # Reserve the path for the entire file transfer.
             with self.reserve(path):
                 if command == "upload":
                     completed = self.upload(path, file_size(request))
@@ -133,9 +142,11 @@ class FileHandler(socketserver.StreamRequestHandler):
 
     @contextmanager
     def reserve(self, path):
+        """Prevent other commands from changing a path during a file transfer."""
         with self.server.storage_lock:
             if path in self.server.active_paths:
                 raise RequestError("The file is currently being processed.")
+            # Other commands use this set to prevent changes during a transfer.
             self.server.active_paths.add(path)
         try:
             yield
@@ -144,6 +155,7 @@ class FileHandler(socketserver.StreamRequestHandler):
                 self.server.active_paths.remove(path)
 
     def upload(self, path, size):
+        """Receive a file into a temporary path and publish it when complete."""
         if not path.parent.is_dir():
             raise RequestError("Destination folder does not exist.")
         if path.exists():
@@ -156,6 +168,8 @@ class FileHandler(socketserver.StreamRequestHandler):
 
         temporary = None
         try:
+            # Write beside the destination first so interrupted uploads never leave
+            # a partially written file visible under the requested name.
             # A completed upload replaces the destination in one filesystem operation.
             with NamedTemporaryFile(dir=path.parent, prefix=TEMP_PREFIX,
                                     delete=False) as output:
@@ -172,6 +186,7 @@ class FileHandler(socketserver.StreamRequestHandler):
         return True
 
     def download(self, path):
+        """Send a file and wait for the client to confirm receiving it."""
         if not path.is_file():
             raise RequestError("File does not exist.")
         with path.open("rb") as source:
@@ -181,15 +196,20 @@ class FileHandler(socketserver.StreamRequestHandler):
             send_file(self.request, source, size)
             self.transfer = perf_counter() - started
             self.size = size
+            # The client confirmation distinguishes a completed transfer from
+            # a connection that closed while the bytes were being sent.
             if read_message(self.rfile).get("status") != "ok":
                 raise ProtocolError("Client did not confirm the download.")
 
 
 class FileServer(socketserver.ThreadingTCPServer):
+    """TCP server that creates one handler thread per client connection."""
+
     allow_reuse_address = True
     daemon_threads = True
 
     def __init__(self, address, root, metrics):
+        """Configure the shared folder, metrics logger, and transfer locks."""
         self.root = root
         self.metrics = metrics
         self.storage_lock = Lock()
@@ -198,6 +218,7 @@ class FileServer(socketserver.ThreadingTCPServer):
 
 
 def local_addresses():
+    """Find non-loopback IPv4 addresses clients can use to reach this server."""
     addresses = set()
     for host in (socket.gethostname(), socket.getfqdn()):
         try:
@@ -211,11 +232,13 @@ def local_addresses():
             addresses.add(probe.getsockname()[0])
     except OSError:
         pass
+    # Loopback is useful for local testing but not for another computer on the network.
     return sorted(address for address in addresses
                   if not ipaddress.ip_address(address).is_loopback)
 
 
 def main():
+    """Parse options, start the server, and keep it running until interrupted."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="0.0.0.0", help="IPv4 address to bind")
     parser.add_argument("--port", type=int, default=5050)
