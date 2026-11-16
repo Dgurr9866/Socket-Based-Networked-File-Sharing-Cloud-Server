@@ -23,6 +23,7 @@ class CommandError(Exception):
 
 class Client:
     def __init__(self, metrics):
+        """Initialize disconnected client state and its metrics recorder."""
         self.metrics = metrics
         self.report = print
         self.entries = None
@@ -31,10 +32,12 @@ class Client:
         self.peer = ""
 
     def disconnect(self):
+        """Close the current connection and clear its socket reference."""
         self.session.close()
         self.connection = None
 
     def connect(self, host, port):
+        """Open a session with the requested server and complete its handshake."""
         if not port.isdecimal() or not 1 <= int(port) <= 65535:
             raise CommandError("Enter a port number from 1 to 65535.")
         self.peer = f"{host}:{port}"
@@ -48,6 +51,7 @@ class Client:
         self.report(f"Connected to {self.peer}")
 
     def reply(self):
+        """Read a server response, measure initial latency, and raise reported errors."""
         message = read_message(self.reader)
         if self.response is None:
             self.response = perf_counter() - self.started
@@ -57,10 +61,12 @@ class Client:
 
     @staticmethod
     def expect(message, status):
+        """Require a response message to have the expected status."""
         if message.get("status") != status:
             raise ProtocolError(f"Expected server status {status!r}.")
 
     def execute(self, command, arguments):
+        """Run one client command and record its outcome and performance metrics."""
         self.outcome = "error"
         self.entries = None
         if self.connection is None and command != "connect":
@@ -105,6 +111,7 @@ class Client:
             )
 
     def simple_command(self, command, path):
+        """Send a non-transfer command and store or report its successful response."""
         send_message(self.connection, command=command, path=path)
         message = self.reply()
         self.expect(message, "ok")
@@ -124,6 +131,7 @@ class Client:
             self.report(f"OK: {path}")
 
     def upload(self, source_path, remote_path):
+        """Upload a local file, optionally replacing an existing remote file."""
         try:
             if not source_path.is_file():
                 raise OSError(f"Local file does not exist: {source_path}")
@@ -154,6 +162,7 @@ class Client:
         return True
 
     def download(self, remote_path, destination):
+        """Download a remote file to a new local destination."""
         if destination.exists():
             raise CommandError(f"Local path already exists: {destination}. Choose another name.")
 
@@ -181,12 +190,14 @@ class Client:
         self.print_transfer("Downloaded", destination)
 
     def print_transfer(self, verb, path):
+        """Report completed transfer size, duration, and throughput."""
         rate = self.size / 1_000_000 / self.transfer if self.transfer else 0
         self.report(f"{verb} {path} ({self.size:,} bytes, {self.transfer:.3f} s, {rate:.2f} MB/s)")
 
 
 class FileWindow:
     def __init__(self, window, client):
+        """Build the client window and initialize its interaction state."""
         self.window = window
         self.client = client
         self.client.report = self.record_message
@@ -281,14 +292,17 @@ class FileWindow:
         self.update_controls()
 
     def run(self):
+        """Start event polling and enter Tkinter's main event loop."""
         self.window.after(40, self.poll_events)
         self.window.mainloop()
 
     def selected(self):
+        """Return the selected remote entry, if the listing has one."""
         selection = self.tree.selection()
         return self.entries.get(selection[0]) if selection else None
 
     def update_controls(self):
+        """Enable controls that are valid for the current connection and selection."""
         available = not self.busy and not self.closing
         connected = available and self.client.connection is not None
         selected = self.selected()
@@ -304,15 +318,18 @@ class FileWindow:
             widget.state(["!disabled" if enabled else "disabled"])
 
     def record_message(self, text):
+        """Queue a client status message for display after its command finishes."""
         self.messages.append(text)
 
     def ask_overwrite(self, path):
+        """Request overwrite confirmation from the Tk main thread."""
         # All Tk calls stay on the main thread. The socket worker waits for the answer.
         answer = Queue(maxsize=1)
         self.events.put(("overwrite", path, answer))
         return answer.get()
 
     def submit(self, command, args, status, *, folder=None):
+        """Start a client command in a worker thread and show progress."""
         if self.busy or self.closing:
             return
         self.busy = True
@@ -323,6 +340,7 @@ class FileWindow:
         Thread(target=self.run_command, args=(command, args, folder), daemon=True).start()
 
     def run_command(self, command, args, folder):
+        """Execute a command off the UI thread and enqueue its result."""
         self.messages = []
         entries = None
         try:
@@ -337,6 +355,7 @@ class FileWindow:
             self.events.put(("done", folder, entries, self.messages.copy()))
 
     def poll_events(self):
+        """Process queued worker results and schedule the next poll."""
         try:
             while True:
                 kind, *data = self.events.get_nowait()
@@ -355,6 +374,7 @@ class FileWindow:
         self.window.after(40, self.poll_events)
 
     def complete(self, folder, entries, messages):
+        """Apply a completed worker command's state to the user interface."""
         self.busy = False
         self.progress.stop()
         self.progress.configure(mode="determinate", value=0)
@@ -372,6 +392,7 @@ class FileWindow:
         self.update_controls()
 
     def show_folder(self, folder, entries):
+        """Display a remote folder's entries in the file listing."""
         self.folder = folder
         self.path_label.set(f"/{folder}")
         self.entries.clear()
@@ -381,6 +402,7 @@ class FileWindow:
             self.entries[row] = (name, is_directory)
 
     def connect(self, event=None):
+        """Submit a connection request using the entered server address."""
         host = self.host.get().strip()
         if host:
             self.submit("connect", [host, self.port.get().strip() or "5050"],
@@ -389,18 +411,23 @@ class FileWindow:
             self.status.set("Enter the server IP address.")
 
     def browse(self, folder):
+        """Load and display the requested remote folder."""
         self.submit("dir", [folder] if folder else [], f"Loading /{folder}...", folder=folder)
 
     def refresh(self):
+        """Reload the folder currently shown in the file listing."""
         self.browse(self.folder)
 
     def go_up(self):
+        """Navigate to the parent of the current remote folder."""
         self.browse(self.folder.rpartition("/")[0])
 
     def remote_path(self, name):
+        """Return a name relative to the folder currently being viewed."""
         return f"{self.folder}/{name}" if self.folder else name
 
     def open_selection(self, event=None):
+        """Open the selected folder, including the folder clicked by a mouse event."""
         if event is not None and event.type == tk.EventType.ButtonPress:
             entry = self.entries.get(self.tree.identify_row(event.y))
         else:
@@ -409,6 +436,7 @@ class FileWindow:
             self.browse(self.remote_path(entry[0]))
 
     def upload(self):
+        """Prompt for a local file and submit it for upload."""
         filename = filedialog.askopenfilename(title="Select file to upload", parent=self.window)
         if filename:
             name = Path(filename).name
@@ -416,6 +444,7 @@ class FileWindow:
                         f"Uploading {name}...", folder=self.folder)
 
     def download(self):
+        """Prompt for a destination and submit the selected file for download."""
         entry = self.selected()
         if entry and not entry[1]:
             name = entry[0]
@@ -426,6 +455,7 @@ class FileWindow:
                 self.submit("download", [self.remote_path(name), filename], f"Downloading {name}...")
 
     def make_folder(self):
+        """Prompt for a folder name and submit its creation."""
         name = simpledialog.askstring("New Folder", "Folder name", parent=self.window)
         if name and name.strip():
             name = name.strip()
@@ -433,6 +463,7 @@ class FileWindow:
                         f"Creating {name}...", folder=self.folder)
 
     def delete(self):
+        """Confirm and submit deletion of the selected remote entry."""
         entry = self.selected()
         if entry:
             name, is_directory = entry
@@ -445,6 +476,7 @@ class FileWindow:
                 self.submit(command, args, f"Deleting {name}...", folder=self.folder)
 
     def close(self):
+        """Close immediately when idle or cancel an active connection before closing."""
         if not self.busy:
             self.window.destroy()
         elif not self.closing and messagebox.askyesno(
@@ -462,6 +494,7 @@ class FileWindow:
 
 
 def main():
+    """Parse client options and start the desktop file-sharing application."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--log", type=Path, default=Path("client_metrics.csv"))
     args = parser.parse_args()
