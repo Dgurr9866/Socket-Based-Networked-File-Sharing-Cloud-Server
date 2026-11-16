@@ -11,10 +11,12 @@ class ProtocolError(Exception):
 
 
 def send_message(connection, **fields):
+    """Send a newline-delimited JSON message over a socket connection."""
     connection.sendall(json.dumps(fields).encode("utf-8") + b"\n")
 
 
 def read_message(reader):
+    """Read and validate one newline-delimited JSON object from a stream."""
     line = reader.readline(MAX_HEADER + 1)
     if not line:
         raise EOFError("Peer closed the connection.")
@@ -30,6 +32,7 @@ def read_message(reader):
 
 
 def file_size(message):
+    """Return a validated nonnegative file size from a protocol message."""
     size = message.get("size")
     if type(size) is not int or size < 0:
         raise ProtocolError("Invalid file size.")
@@ -37,6 +40,7 @@ def file_size(message):
 
 
 def send_file(connection, source, remaining):
+    """Send exactly the requested number of bytes from an open source file."""
     while remaining:
         chunk = source.read(min(CHUNK_SIZE, remaining))
         if not chunk:
@@ -46,6 +50,7 @@ def send_file(connection, source, remaining):
 
 
 def receive_file(reader, destination, remaining):
+    """Write exactly the requested number of bytes from a stream to a file."""
     while remaining:
         chunk = reader.read(min(CHUNK_SIZE, remaining))
         if not chunk:
